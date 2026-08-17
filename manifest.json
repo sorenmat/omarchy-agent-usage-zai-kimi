@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "smo.agent-usage-zcode",
+  "name": "Agent Usage: Z.ai (zcode)",
+  "version": "0.1.0",
+  "author": "smo",
+  "license": "MIT",
+  "description": "Adds a Z.ai GLM Coding Plan quota tab to Omarchy's built-in Agents panel, authenticating with the zcode desktop app login.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

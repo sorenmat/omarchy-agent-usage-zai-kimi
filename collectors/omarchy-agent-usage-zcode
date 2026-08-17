@@ -1,0 +1,261 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Z.ai usage record as JSON using the zcode login
+"""Collect Z.ai GLM Coding Plan quota into one display-ready JSON record.
+
+Quoted limits come from api.z.ai's usage monitor: a 5-hour token window, a
+7-day token window, and the monthly web-search allowance, plus the plan level
+(lite/standard/pro). The bearer token comes from ZAI_API_KEY when set,
+otherwise from the zcode desktop app's sign-in at ~/.zcode/v2/credentials.json.
+zcode stores the Z.ai OAuth access token AES-256-GCM encrypted under the
+"enc:v1:" prefix, keyed by sha256 of a machine-local secret — the ZCODE_CREDENTIAL_SECRET
+environment variable when zcode was started with one, else the built-in
+fallback string "zcode-credential-fallback:<platform>:<home>:<user>". The
+token is decrypted in memory, sent only to api.z.ai, and never written
+anywhere. The agents panel only ever reads the JSON this prints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "zai"
+AGENT_NAME = "Z.ai"
+AUTH_HELP = "Set ZAI_API_KEY or sign in to Z.ai inside the zcode app."
+QUOTA_URL = os.environ.get("ZAI_QUOTA_URL", "https://api.z.ai/api/monitor/usage/quota/limit")
+# The bearer token may only leave this machine for hosts under this domain.
+ALLOWED_DOMAIN = "z.ai"
+CREDENTIALS_PATH = Path.home() / ".zcode" / "v2" / "credentials.json"
+ACCESS_TOKEN_KEY = "oauth:zai:access_token"
+CIPHER_PREFIX = "enc:v1:"
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+  # urllib would copy every header (including the bearer token) onto the
+  # redirect target, potentially leaking it cross-host. Never follow.
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    return None
+
+
+def trusted_url(url: str) -> tuple[str, bool]:
+  """Require HTTPS; report whether the host may receive credentials."""
+  try:
+    parts = urllib.parse.urlsplit(url)
+  except ValueError as error:
+    raise ZaiError("Z.ai endpoint URL is invalid") from error
+  if parts.scheme != "https":
+    raise ZaiError("Z.ai endpoint must use HTTPS")
+  host = (parts.hostname or "").lower()
+  return url, host == ALLOWED_DOMAIN or host.endswith("." + ALLOWED_DOMAIN)
+
+
+class ZaiError(Exception):
+  pass
+
+
+def empty_stats() -> dict[str, Any]:
+  return {
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+
+
+def base_record(**overrides: Any) -> dict[str, Any]:
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": False,
+    "hasLocalStats": False,
+    # Quota numbers are account-global, not machine-local: every synced device
+    # reports the same truth, so aggregation must not sum them.
+    "scope": "account",
+    "hasPromptStats": False,
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+  }
+  record.update(empty_stats())
+  record.update(overrides)
+  return record
+
+
+# ------------------------------------------------------------------- zcode
+
+
+def zcode_cipher_key() -> bytes:
+  """Reproduce zcode's AES-256-GCM key derivation for enc:v1 credentials."""
+  secret = os.environ.get("ZCODE_CREDENTIAL_SECRET", "").strip()
+  if not secret:
+    user = "unknown"
+    try:
+      user = os.environ.get("USER") or Path.home().name or "unknown"
+    except OSError:
+      pass
+    platform = sys.platform if sys.platform != "linux2" else "linux"
+    secret = f"zcode-credential-fallback:{platform}:{Path.home()}:{user}"
+  return hashlib.sha256(secret.encode()).digest()
+
+
+def decrypt_zcode_value(value: str) -> str:
+  """Decrypt one enc:v1:<iv>.<tag>.<ciphertext> credentials.json entry."""
+  if not value.startswith(CIPHER_PREFIX):
+    return value
+  try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+  except ImportError as error:
+    raise ZaiError("zcode credentials need the python cryptography package") from error
+  parts = value[len(CIPHER_PREFIX) :].split(".")
+  if len(parts) != 3:
+    raise ZaiError("zcode credential has an invalid ciphertext format")
+  try:
+    iv, tag, ciphertext = (
+      base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)) for part in parts
+    )
+    return AESGCM(zcode_cipher_key()).decrypt(iv, ciphertext + tag, None).decode()
+  except ZaiError:
+    raise
+  except Exception as error:
+    raise ZaiError("zcode credentials could not be decrypted") from error
+
+
+def zcode_access_token() -> str:
+  """Read the Z.ai OAuth token from the zcode app's encrypted credentials."""
+  try:
+    credentials = json.loads(CREDENTIALS_PATH.read_text())
+  except (OSError, json.JSONDecodeError):
+    return ""
+  entry = credentials.get(ACCESS_TOKEN_KEY) if isinstance(credentials, dict) else None
+  if not isinstance(entry, str) or not entry.strip():
+    return ""
+  try:
+    token = decrypt_zcode_value(entry).strip()
+  except ZaiError:
+    raise
+  return token if token else ""
+
+
+def api_key() -> str:
+  key = os.environ.get("ZAI_API_KEY", "").strip()
+  if key:
+    return key
+  return zcode_access_token()
+
+
+# -------------------------------------------------------------------- quota
+
+
+def quota(key: str) -> dict[str, Any]:
+  url, trusted = trusted_url(QUOTA_URL)
+  headers = {"Accept": "application/json"}
+  if trusted:
+    headers["Authorization"] = "Bearer " + key
+  request = urllib.request.Request(url, headers=headers)
+  try:
+    with urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=15) as response:
+      decoded = json.load(response)
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      raise ZaiError("Z.ai rejected the credentials — re-sign in inside zcode") from error
+    raise ZaiError(f"Z.ai API returned HTTP {error.code}") from error
+  except urllib.error.URLError as error:
+    raise ZaiError("Could not reach the Z.ai API") from error
+  except (json.JSONDecodeError, TimeoutError) as error:
+    raise ZaiError("Z.ai returned an invalid quota response") from error
+  if not isinstance(decoded, dict) or not decoded.get("success"):
+    raise ZaiError("Z.ai reported an unsuccessful quota response")
+  data = decoded.get("data")
+  if not isinstance(data, dict):
+    raise ZaiError("Z.ai returned an empty quota response")
+  return data
+
+
+def reset_at(entry: dict[str, Any]) -> str:
+  millis = entry.get("nextResetTime")
+  try:
+    stamp = datetime.fromtimestamp(float(millis) / 1000, tz=timezone.utc)
+  except (TypeError, ValueError, OverflowError, OSError):
+    return ""
+  return stamp.isoformat().replace("+00:00", "Z")
+
+
+def window_label(entry: dict[str, Any]) -> str:
+  kind = str(entry.get("type") or "")
+  unit = entry.get("unit")
+  number = entry.get("number")
+  if kind == "TIME_LIMIT":
+    return "Search (monthly)" if (unit, number) == (5, 1) else "Search"
+  if kind in ("TOKENS_LIMIT", "CREDIT_LIMIT"):
+    if (unit, number) == (3, 5):
+      return "Session (5-hour)"
+    if (unit, number) == (6, 1):
+      return "Weekly (7-day)"
+  return "Tokens"
+
+
+def to_limits(data: dict[str, Any]) -> list[dict[str, Any]]:
+  limits = []
+  entries = data.get("limits")
+  if not isinstance(entries, list):
+    return limits
+  for entry in entries:
+    if not isinstance(entry, dict):
+      continue
+    try:
+      percent = min(1.0, max(0.0, float(entry.get("percentage") or 0) / 100))
+    except (TypeError, ValueError):
+      continue
+    limits.append({"label": window_label(entry), "percent": percent, "resetsAt": reset_at(entry)})
+  return limits
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print the Z.ai usage record as JSON")
+  # Flags accepted so the collector answers the same invocation as the others.
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.parse_args()
+
+  try:
+    key = api_key()
+    if not key:
+      record = base_record(usageStatusText="Z.ai unavailable", authHelpText=AUTH_HELP)
+    else:
+      data = quota(key)
+      level = str(data.get("level") or "").strip()
+      record = base_record(
+        ready=True,
+        hasLocalStats=True,
+        tierLabel=f"Coding Plan {level.capitalize()}" if level else "Coding Plan",
+        limits=to_limits(data),
+      )
+  except ZaiError as error:
+    record = base_record(usageStatusText="Z.ai unavailable", authHelpText=str(error))
+  except Exception:
+    record = base_record(usageStatusText="Z.ai unavailable", authHelpText="Z.ai usage scan failed")
+  print(json.dumps(record, separators=(",", ":")))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
