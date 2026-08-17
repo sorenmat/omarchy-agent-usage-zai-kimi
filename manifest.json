@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "smo.agent-usage-zcode",
-  "name": "Agent Usage: Z.ai (zcode)",
-  "version": "0.1.0",
+  "name": "Agent Usage: Z.ai + Kimi",
+  "version": "0.2.0",
   "author": "smo",
   "license": "MIT",
-  "description": "Adds a Z.ai GLM Coding Plan quota tab to Omarchy's built-in Agents panel, authenticating with the zcode desktop app login.",
+  "description": "Adds Z.ai (GLM Coding Plan) and Kimi for Coding quota tabs to Omarchy's built-in Agents panel, authenticating with the zcode and kimi-cli desktop app logins.",
   "kinds": ["service"],
   "entryPoints": {
     "service": "Service.qml"

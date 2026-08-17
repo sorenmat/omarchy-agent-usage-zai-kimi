@@ -1,12 +1,12 @@
-# Agent Usage: Z.ai (zcode)
+# Agent Usage: Z.ai + Kimi
 
-An Omarchy (Quattro) **service plugin** that adds a **Z.ai (GLM Coding Plan)**
-usage tab to Omarchy's built-in **Agents** panel — the panel that already ships
-Claude, Codex, and Fireworks tabs.
+An Omarchy (Quattro) **service plugin** that adds **Z.ai (GLM Coding Plan)** and
+**Kimi for Coding** usage tabs to Omarchy's built-in **Agents** panel — the panel
+that already ships Claude, Codex, and Fireworks tabs.
 
-Unlike other Z.ai collectors, this one needs no API key and no opencode
-sign-in: it authenticates with the login you already have in the
-**zcode desktop app**.
+Unlike other Z.ai/Kimi collectors, this one needs no API key and no opencode
+sign-in: it authenticates with the login you already have in the **zcode** and
+**kimi-code** desktop apps.
 
 ## How it works
 
@@ -17,11 +17,16 @@ so third-party providers need their own publisher.
 
 This plugin is a headless `service` that:
 
-1. Runs the bundled Python collector every 5 minutes (and on shell start).
-2. Validates the collector's JSON output.
-3. Publishes the record to the usage state directory with atomic writes.
+1. Runs each bundled Python collector every 5 minutes (and on shell start).
+2. Validates each collector's JSON output.
+3. Publishes the records to the usage state directory with atomic writes.
+
+Adding another provider means adding a `collectors/omarchy-agent-usage-*`
+script and one entry in `Service.qml`'s `collectors` list.
 
 ## Authentication
+
+### Z.ai
 
 The bearer token is resolved in this order:
 
@@ -40,21 +45,43 @@ The bearer token is resolved in this order:
 Re-sign in inside zcode whenever the token expires; the collector reports
 "Z.ai rejected the credentials" until then.
 
+### Kimi
+
+The bearer token is resolved in this order:
+
+1. `KIMI_API_KEY` environment variable, when set.
+2. The kimi-code sign-in at `$KIMI_CODE_HOME/credentials/kimi-code.json`
+   (default `~/.kimi-code/credentials/kimi-code.json`), falling back to the
+   legacy kimi-cli store at `~/.kimi/credentials/kimi-code.json` — plain JSON
+   with an OAuth `access_token`/`refresh_token` pair. Access tokens expire, so
+   the collector refreshes them exactly the way the CLI does: under a `flock`
+   on the sibling `kimi-code.lock`, a form POST of the refresh token to
+   `auth.kimi.com/api/oauth/token` with the public client id. The server
+   issues single-use refresh tokens, so the rotated pair is always persisted
+   back to the credentials file (mode 0600, atomic replace) — both this
+   collector and the CLI keep working from the same file. Tokens go only to
+   hosts under `kimi.com` over HTTPS and never anywhere else.
+
+When the refresh token itself expires (the CLI shows the same), run
+`kimi login`, and the tab recovers on the next scan.
+
 ## What it shows
 
-- Plan tier (lite/standard/pro)
-- The 5-hour session token window
-- The 7-day token window
-- The monthly web-search allowance
-
-straight from the `api.z.ai` usage monitor.
+- Z.ai: plan tier (lite/standard/pro), the 5-hour session window, the 7-day
+  token window, and the monthly web-search allowance — from the `api.z.ai`
+  usage monitor.
+- Kimi: the weekly quota and per-window limits (e.g. the 5-hour session) —
+  from the same `api.kimi.com` usage endpoint the kimi-cli `/usage` command
+  renders.
 
 ## Requirements
 
 - Omarchy (Quattro) with the built-in **Agents** widget enabled
   (`omarchy plugin list` shows `omarchy.agents` enabled).
-- `python3` with the `cryptography` package (used by every Arch/omarchy
-  install that runs zcode; `omarchy pkg add python-cryptography` otherwise).
+- `python3` (the Kimi collector additionally uses stdlib `fcntl` on Linux).
+- For Z.ai: the `cryptography` package (used by every Arch/omarchy install
+  that runs zcode; `omarchy pkg add python-cryptography` otherwise).
+- For Kimi: a sign-in from [Kimi Code](https://www.kimi.com/code/docs/en/) (`kimi login`).
 
 ## Install
 
@@ -66,11 +93,11 @@ omarchy plugin add ~/code/omarchy-agent-usage-zcode --enable
 
 ```sh
 omarchy plugin remove smo.agent-usage-zcode
-rm -f ~/.local/state/omarchy/agents/usage/zai.json
+rm -f ~/.local/state/omarchy/agents/usage/zai.json ~/.local/state/omarchy/agents/usage/kimi.json
 ```
 
-The panel has no expiry for records, so removing the last-written file stops
-the (now stale) tab from lingering.
+The panel has no expiry for records, so removing the last-written files stops
+the (now stale) tabs from lingering.
 
 ## Development
 
@@ -78,7 +105,13 @@ the (now stale) tab from lingering.
 omarchy plugin validate .
 qmllint -I /usr/share/omarchy/shell Service.qml
 collectors/omarchy-agent-usage-zcode | jq .
+collectors/omarchy-agent-usage-kimi | jq .
 ```
+
+The Kimi collector can be pointed at a mock endpoint for testing the parsing
+without a live login: `KIMI_USAGE_URL` overrides the usage endpoint (plain
+HTTP is allowed for loopback hosts only) and `KIMI_API_KEY` bypasses the
+credentials file.
 
 ## License
 
