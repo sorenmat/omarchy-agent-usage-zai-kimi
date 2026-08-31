@@ -50,17 +50,19 @@ Re-sign in inside zcode whenever the token expires; the collector reports
 The bearer token is resolved in this order:
 
 1. `KIMI_API_KEY` environment variable, when set.
-2. The kimi-code sign-in at `$KIMI_CODE_HOME/credentials/kimi-code.json`
-   (default `~/.kimi-code/credentials/kimi-code.json`), falling back to the
-   legacy kimi-cli store at `~/.kimi/credentials/kimi-code.json` — plain JSON
-   with an OAuth `access_token`/`refresh_token` pair. Access tokens expire, so
+2. The active kimi-code sign-in under `$KIMI_CODE_HOME/credentials/`
+   (default `~/.kimi-code/credentials/`), including the regional
+   `kimi-code-env-<hash>.json` slots used by current releases, falling back to
+   the legacy kimi-cli store at `~/.kimi/credentials/kimi-code.json` — plain
+   JSON with an OAuth `access_token`/`refresh_token` pair. The active slot and
+   regional API hosts come from kimi-code's `config.toml`. Access tokens expire, so
    the collector refreshes them exactly the way the CLI does: under a `flock`
    on the sibling `kimi-code.lock`, a form POST of the refresh token to
    `auth.kimi.com/api/oauth/token` with the public client id. The server
    issues single-use refresh tokens, so the rotated pair is always persisted
    back to the credentials file (mode 0600, atomic replace) — both this
    collector and the CLI keep working from the same file. Tokens go only to
-   hosts under `kimi.com` over HTTPS and never anywhere else.
+   hosts under `kimi.com` or `kimi.ai` over HTTPS and never anywhere else.
 
 When the refresh token itself expires (the CLI shows the same), run
 `kimi login`, and the tab recovers on the next scan.

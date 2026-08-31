@@ -7,20 +7,21 @@
 Quoted limits come from api.kimi.com's usage monitor (the same payload the
 kimi-cli /usage command renders): a weekly quota plus per-window limits such as
 the 5-hour session window. The bearer token comes from KIMI_API_KEY when set,
-otherwise from the kimi-code sign-in at $KIMI_CODE_HOME/credentials/kimi-code.json
-(default ~/.kimi-code/credentials/kimi-code.json), falling back to the legacy
-kimi-cli store at ~/.kimi/credentials/kimi-code.json (plain JSON, kept under a
-flock on the sibling kimi-code.lock).
+otherwise from the active kimi-code sign-in under $KIMI_CODE_HOME/credentials
+(default ~/.kimi-code/credentials), falling back to the legacy kimi-cli store
+at ~/.kimi/credentials/kimi-code.json (plain JSON, kept under a flock on the
+sibling kimi-code.lock). Current kimi-code versions record the active OAuth
+credential filename and regional API hosts in config.toml.
 
 Access tokens expire, so this collector refreshes them the way kimi-cli does:
 POST the refresh_token to auth.kimi.com/api/oauth/token with kimi-cli's public
 client id, take the flock first (another kimi-cli process may be refreshing),
 and persist the rotated tokens back to the credentials file, since the server
 issues single-use refresh tokens, so the new one must never be discarded. Tokens are
-sent only to hosts under kimi.com over HTTPS (redirects are refused; plain HTTP
-is allowed only for loopback testing endpoints) and never written anywhere but
-the credentials file itself. The agents panel only ever reads the JSON this
-prints.
+sent only to hosts under kimi.com or kimi.ai over HTTPS (redirects are refused;
+plain HTTP is allowed only for loopback testing endpoints) and never written
+anywhere but the credentials file itself. The agents panel only ever reads the
+JSON this prints.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import json
 import os
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,16 +43,40 @@ from typing import Any
 AGENT_ID = "kimi"
 AGENT_NAME = "Kimi"
 AUTH_HELP = "Set KIMI_API_KEY or sign in to Kimi (run `kimi login`)."
+
+
+def kimi_settings() -> tuple[str, str, str]:
+  """Read the API hosts and credential slot selected by kimi-code."""
+  home = Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code")
+  base_url = "https://api.kimi.com/coding/v1"
+  oauth_host = "https://auth.kimi.com"
+  credential_name = "kimi-code.json"
+  try:
+    config = tomllib.loads((home / "config.toml").read_text())
+    provider = config.get("providers", {}).get("managed:kimi-code", {})
+    oauth = provider.get("oauth", {})
+    base_url = str(provider.get("base_url") or base_url)
+    oauth_host = str(oauth.get("oauth_host") or oauth_host)
+    oauth_key = str(oauth.get("key") or "")
+    name = oauth_key.removeprefix("oauth/")
+    if oauth_key.startswith("oauth/") and name and "/" not in name:
+      credential_name = name + ".json"
+  except (OSError, tomllib.TOMLDecodeError, AttributeError):
+    pass
+  return base_url, oauth_host, credential_name
+
+
+CONFIG_BASE_URL, CONFIG_OAUTH_HOST, CREDENTIAL_NAME = kimi_settings()
 USAGE_URL = os.environ.get("KIMI_USAGE_URL") or (
-  os.environ.get("KIMI_CODE_BASE_URL", "https://api.kimi.com/coding/v1").rstrip("/") + "/usages"
+  os.environ.get("KIMI_CODE_BASE_URL", CONFIG_BASE_URL).rstrip("/") + "/usages"
 )
 OAUTH_HOST = (
-  os.environ.get("KIMI_CODE_OAUTH_HOST") or os.environ.get("KIMI_OAUTH_HOST") or "https://auth.kimi.com"
+  os.environ.get("KIMI_CODE_OAUTH_HOST") or os.environ.get("KIMI_OAUTH_HOST") or CONFIG_OAUTH_HOST
 )
 TOKEN_URL = OAUTH_HOST.rstrip("/") + "/api/oauth/token"
 OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-# Tokens may only leave this machine for hosts under this domain.
-ALLOWED_DOMAIN = "kimi.com"
+# Tokens may only leave this machine for official Kimi hosts.
+ALLOWED_DOMAINS = ("kimi.com", "kimi.ai")
 REFRESH_SKEW_S = 60
 
 
@@ -63,13 +89,13 @@ def credentials_dir() -> Path:
   candidates.append(Path.home() / ".kimi-code" / "credentials")
   candidates.append(Path.home() / ".kimi" / "credentials")
   for candidate in candidates:
-    if (candidate / "kimi-code.json").is_file():
+    if (candidate / CREDENTIAL_NAME).is_file():
       return candidate
   return candidates[0]
 
 
 CREDENTIALS_DIR = credentials_dir()
-CREDENTIALS_PATH = CREDENTIALS_DIR / "kimi-code.json"
+CREDENTIALS_PATH = CREDENTIALS_DIR / CREDENTIAL_NAME
 CREDENTIALS_LOCK = CREDENTIALS_DIR / "kimi-code.lock"
 
 
@@ -94,7 +120,8 @@ def trusted_url(url: str) -> tuple[str, bool]:
   loopback = host in ("localhost", "127.0.0.1", "::1")
   if parts.scheme != "https" and not (loopback and parts.scheme == "http"):
     raise KimiError("Kimi endpoint must use HTTPS")
-  return url, host == ALLOWED_DOMAIN or host.endswith("." + ALLOWED_DOMAIN)
+  trusted = any(host == domain or host.endswith("." + domain) for domain in ALLOWED_DOMAINS)
+  return url, trusted
 
 
 def empty_stats() -> dict[str, Any]:
@@ -169,7 +196,7 @@ def request_refresh(refresh_token: str) -> dict[str, Any]:
       "refresh_token": refresh_token,
     }
   ).encode()
-  headers = {"Content-Type": "application/x-www-form-urlencoded"}
+  headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "kimi-code"}
   request = urllib.request.Request(url, data=form, headers=headers)
   try:
     with urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=15) as response:
@@ -247,7 +274,7 @@ def api_key() -> str:
 
 def quota(key: str) -> dict[str, Any]:
   url, trusted = trusted_url(USAGE_URL)
-  headers = {"Accept": "application/json"}
+  headers = {"Accept": "application/json", "User-Agent": "kimi-code"}
   if trusted:
     headers["Authorization"] = "Bearer " + key
   request = urllib.request.Request(url, headers=headers)

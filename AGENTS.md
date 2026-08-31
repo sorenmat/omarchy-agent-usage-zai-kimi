@@ -77,12 +77,15 @@ from `empty_stats()`. Semantics an agent could easily break:
   string `zcode-credential-fallback:<platform>:<home>:<user>`). If you touch
   the decryption, re-read zcode's derivation — this repo reproduces it exactly.
 - **Kimi auth order**: `KIMI_API_KEY` env var wins; otherwise the OAuth pair
-  is read from the kimi-code store at `$KIMI_CODE_HOME/credentials/kimi-code.json`
-  (default `~/.kimi-code/...`), falling back to the legacy kimi-cli store at
-  `~/.kimi/credentials/kimi-code.json` (plain JSON).
+  is read from the active kimi-code slot under `$KIMI_CODE_HOME/credentials/`
+  (default `~/.kimi-code/...`). Current releases record a regional
+  `kimi-code-env-<hash>.json` key and API hosts in `config.toml`; older releases
+  use `kimi-code.json`. The collector falls back to the legacy kimi-cli store
+  at `~/.kimi/credentials/kimi-code.json` (plain JSON).
   Access tokens expire, so the collector refreshes them itself: form POST of
   the refresh token to `auth.kimi.com/api/oauth/token` with the public
-  client id (`17e5f671-…`), taken under a `flock` on the sibling
+  client id (`17e5f671-…`), using the configured `kimi.com` or `kimi.ai`
+  regional host, taken under a `flock` on the sibling
   `kimi-code.lock`. **The server issues single-use refresh tokens: a refreshed
   pair must always be persisted back (atomic replace, mode 0600) or the
   user's kimi login is destroyed.** After acquiring the lock, re-read the
@@ -90,7 +93,8 @@ from `empty_stats()`. Semantics an agent could easily break:
   refresh token expired: surface "sign in again with `kimi login`"; nothing
   code can fix.
 - **Token security invariants** (do not regress in either collector): tokens
-  are sent only to the provider's own domain (`z.ai` / `kimi.com` subdomains)
+  are sent only to the provider's own domain (`z.ai` / `kimi.com` / `kimi.ai`
+  subdomains)
   over HTTPS, HTTP redirects are refused (`NoRedirectHandler` — urllib would
   otherwise forward the Authorization header cross-host), and tokens are never
   written to disk, logs, or the published record. The one deliberate
