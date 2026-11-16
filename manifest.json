@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "smo.agent-usage-zcode",
   "name": "Agent Usage: Z.ai + Kimi",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "smo",
   "license": "MIT",
-  "description": "Adds Z.ai (GLM Coding Plan) and Kimi for Coding quota tabs to Omarchy's built-in Agents panel, authenticating with the zcode and kimi-cli desktop app logins.",
+  "description": "Feeds the zcode and kimi-code desktop logins to Omarchy's built-in Z.ai and Kimi usage collectors, so their Agents panel tabs authenticate without a hand-entered API key.",
   "kinds": ["service"],
   "entryPoints": {
     "service": "Service.qml"

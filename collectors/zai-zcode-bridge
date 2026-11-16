@@ -1,0 +1,153 @@
+#!/usr/bin/python3
+# omarchy:summary=Bridge the zcode Z.ai sign-in into omarchy's built-in Z.ai usage collector
+"""Keep the built-in Z.ai usage collector signed in with the zcode app's login.
+
+The built-in omarchy-agent-usage-zai collector resolves its key from
+~/.config/omarchy/agents/zai.json first, then ZAI_API_KEY / ZHIPU_API_KEY in
+the environment, then pi/omp stores. It cannot read the zcode desktop app's
+sign-in, so this bridge keeps that config file in step with zcode's own
+credentials at ~/.zcode/v2/credentials.json: the "oauth:zai:access_token"
+entry, stored AES-256-GCM encrypted under the "enc:v1:" prefix, keyed by
+sha256 of a machine-local secret (ZCODE_CREDENTIAL_SECRET when zcode was
+started with one, else the built-in fallback string
+"zcode-credential-fallback:<platform>:<home>:<user>"). The derivation is
+reproduced exactly; if zcode changes it, re-read zcode's source before
+touching the decryption here.
+
+The token is decrypted in memory and written only to the config file (mode
+0600, atomic replace), tagged with a bridge marker so a hand-written config
+is never clobbered. The built-in collector does everything else from there:
+the quota probe, limits caching, local stats. This prints nothing on
+success; problems go to stderr and the exit code stays 0, so a failed scan
+never looks like a crash to the service that runs it.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+BRIDGE_MARKER = "smo.agent-usage-zcode:zcode"
+CREDENTIALS_PATH = Path.home() / ".zcode" / "v2" / "credentials.json"
+ACCESS_TOKEN_KEY = "oauth:zai:access_token"
+CIPHER_PREFIX = "enc:v1:"
+
+
+class ZcodeError(Exception):
+  pass
+
+
+def zcode_cipher_key() -> bytes:
+  """Reproduce zcode's AES-256-GCM key derivation for enc:v1 credentials."""
+  secret = os.environ.get("ZCODE_CREDENTIAL_SECRET", "").strip()
+  if not secret:
+    user = "unknown"
+    try:
+      user = os.environ.get("USER") or Path.home().name or "unknown"
+    except OSError:
+      pass
+    platform = sys.platform if sys.platform != "linux2" else "linux"
+    secret = f"zcode-credential-fallback:{platform}:{Path.home()}:{user}"
+  return hashlib.sha256(secret.encode()).digest()
+
+
+def decrypt_zcode_value(value: str) -> str:
+  """Decrypt one enc:v1:<iv>.<tag>.<ciphertext> credentials.json entry."""
+  try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+  except ImportError as error:
+    raise ZcodeError("zcode credentials need the python cryptography package") from error
+  parts = value[len(CIPHER_PREFIX) :].split(".")
+  if len(parts) != 3:
+    raise ZcodeError("zcode credential has an invalid ciphertext format")
+  try:
+    iv, tag, ciphertext = (
+      base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)) for part in parts
+    )
+    return AESGCM(zcode_cipher_key()).decrypt(iv, ciphertext + tag, None).decode()
+  except ZcodeError:
+    raise
+  except Exception as error:
+    raise ZcodeError("zcode credentials could not be decrypted") from error
+
+
+def zcode_access_token() -> str:
+  """Read and decrypt the Z.ai OAuth token; "" when zcode is not signed in."""
+  try:
+    credentials = json.loads(CREDENTIALS_PATH.read_text())
+  except (OSError, json.JSONDecodeError):
+    return ""
+  entry = credentials.get(ACCESS_TOKEN_KEY) if isinstance(credentials, dict) else None
+  if not isinstance(entry, str) or not entry.strip():
+    return ""
+  if not entry.startswith(CIPHER_PREFIX):
+    return entry.strip()
+  return decrypt_zcode_value(entry).strip()
+
+
+# -------------------------------------------------------------------- bridge
+
+
+def config_path() -> Path:
+  config_home = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config"))
+  return config_home / "omarchy" / "agents" / "zai.json"
+
+
+def read_json(path: Path) -> dict[str, Any]:
+  try:
+    parsed = json.loads(path.read_text())
+  except (OSError, json.JSONDecodeError):
+    return {}
+  return parsed if isinstance(parsed, dict) else {}
+
+
+def is_ours(path: Path) -> bool:
+  """True when this bridge (not a human) last wrote the config file."""
+  return read_json(path).get("__bridgedBy") == BRIDGE_MARKER
+
+
+def write_atomic(path: Path, payload: dict[str, Any]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+  try:
+    with os.fdopen(fd, "w") as handle:
+      json.dump(payload, handle)
+      handle.flush()
+      os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+  finally:
+    Path(temporary).unlink(missing_ok=True)
+
+
+def main() -> int:
+  path = config_path()
+  try:
+    token = zcode_access_token()
+  except ZcodeError as error:
+    # The previous bridge (if any) may still hold a live token: keep it and
+    # report the read problem instead of dropping the sign-in.
+    print(f"agent-usage-zcode: {error}", file=sys.stderr)
+    return 0
+  if not token:
+    if path.exists() and is_ours(path):
+      # zcode is signed out: stop standing in for it so the built-in
+      # collector falls back to its own credential sources.
+      path.unlink(missing_ok=True)
+    return 0
+  payload = {"apiKey": token, "__bridgedBy": BRIDGE_MARKER}
+  current = read_json(path)
+  if current.get("apiKey") == token and is_ours(path):
+    return 0
+  write_atomic(path, payload)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

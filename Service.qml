@@ -2,12 +2,21 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Feeds the built-in omarchy.agents panel usage records collected with each
-// provider's own desktop login (zcode for Z.ai, kimi-cli for Kimi). The panel
-// draws whatever lands in the usage state directory; this service only runs
-// the bundled collectors on a cadence and publishes their output there,
-// mirroring what omarchy-agent-usage-update does for the packaged collectors
-// in OMARCHY_PATH/bin.
+// Feeds the built-in omarchy.agents panel's Z.ai and Kimi collectors with
+// the desktop-app logins they cannot reach themselves. Omarchy now ships
+// first-party omarchy-agent-usage-zai and -kimi collectors, and the panel
+// runs them itself on its own cadence, so this service no longer publishes
+// usage records. It only keeps their credentials in step:
+//
+//   - zai: the zcode app's Z.ai sign-in, bridged into
+//     ~/.config/omarchy/agents/zai.json, which the built-in collector
+//     reads first.
+//   - kimi: the kimi-code app's sign-in, kept readable at the store path
+//     the built-in collector scans (normally a symlink to the regional
+//     credential file the current CLI writes).
+//
+// Each bridge is a single-file Python script under collectors/, run every
+// 5 minutes and on shell start. Add an entry to `bridges` for another one.
 Item {
   id: root
 
@@ -20,22 +29,20 @@ Item {
   readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
 
-  // One delegate per collector: runs the script and publishes its record as
-  // <recordId>.json. Add an entry here to support another provider.
-  readonly property var collectors: [
+  readonly property var bridges: [
     {
-      "recordId": "zai",
-      "script": "omarchy-agent-usage-zcode"
+      "name": "zai",
+      "script": "zai-zcode-bridge"
     },
     {
-      "recordId": "kimi",
-      "script": "omarchy-agent-usage-kimi"
+      "name": "kimi",
+      "script": "kimi-store-bridge"
     }
   ]
 
   function refresh() {
-    for (var i = 0; i < collectorRepeater.count; i++) {
-      var item = collectorRepeater.itemAt(i);
+    for (var i = 0; i < bridgeRepeater.count; i++) {
+      var item = bridgeRepeater.itemAt(i);
       if (item && item.refresh)
         item.refresh();
     }
@@ -64,53 +71,31 @@ Item {
   }
 
   Repeater {
-    id: collectorRepeater
-    model: root.collectors
+    id: bridgeRepeater
+    model: root.bridges
 
     delegate: Item {
-      id: collectorItem
+      id: bridgeItem
 
       required property var modelData
 
       function refresh() {
-        if (!collector.running)
-          collector.running = true;
+        if (!bridge.running)
+          bridge.running = true;
       }
 
       Process {
-        id: collector
-        command: ["python3", root.pluginDir + "/collectors/" + collectorItem.modelData.script]
-        stdout: StdioCollector {
+        id: bridge
+        command: ["python3", root.pluginDir + "/collectors/" + bridgeItem.modelData.script]
+        stderr: StdioCollector {
           waitForEnd: true
-          onStreamFinished: collectorItem.publish(text)
+          onStreamFinished: if (text.trim() !== "")
+            console.warn("agent-usage-zcode: " + bridgeItem.modelData.name + ": " + text.trim());
         }
         onExited: function(exitCode) {
           if (exitCode !== 0)
-            console.warn("agent-usage-zcode: " + collectorItem.modelData.script + " exited " + exitCode);
+            console.warn("agent-usage-zcode: " + bridgeItem.modelData.name + " exited " + exitCode);
         }
-      }
-
-      function publish(output) {
-        var record = null;
-        try {
-          record = JSON.parse(output);
-        } catch (e) {
-          record = null;
-        }
-        if (record && typeof record === "object" && record.id === collectorItem.modelData.recordId) {
-          recordWriter.setText(output.trim() + "\n");
-        } else {
-          console.warn("agent-usage-zcode: invalid record from " + collectorItem.modelData.script);
-        }
-      }
-
-      // atomicWrites so the panel's file watcher never sees a torn record.
-      FileView {
-        id: recordWriter
-        path: root.usageDir + "/" + collectorItem.modelData.recordId + ".json"
-        watchChanges: false
-        atomicWrites: true
-        printErrors: true
       }
     }
   }

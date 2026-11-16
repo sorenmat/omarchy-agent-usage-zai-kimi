@@ -1,0 +1,436 @@
+#!/usr/bin/python3
+# omarchy:summary=Keep the kimi-code sign-in readable by omarchy's built-in Kimi usage collector
+"""Keep the built-in Kimi usage collector signed in with the kimi-code app's
+login.
+
+The built-in omarchy-agent-usage-kimi collector resolves its key from
+KIMI_API_KEY first, then the OAuth pair at
+$KIMI_CODE_HOME/credentials/kimi-code.json (default
+~/.kimi-code/credentials/kimi-code.json), falling back to the legacy
+kimi-cli store. Current kimi-code releases instead keep the active pair in a
+regional file, credentials/kimi-code-env-<hash>.json, named by
+[providers."managed:kimi-code".oauth].key in config.toml (which also names
+the regional login host). This bridge keeps the collector-facing
+kimi-code.json in step with the active regional file: normally a symlink to
+it, so the app, the CLI and the collector all read one store. When the
+bridge file instead holds the newer pair (the built-in collector refreshes
+through it and its atomic replace swaps the link for a real file), its pair
+is copied into the regional file and the link is restored.
+
+Access tokens expire (about fifteen minutes), so when every copy is stale
+the bridge refreshes the pair itself, the way the CLI does: under the
+store's own lock (kimi-code's directory lease at <home>/oauth/kimi-code.lock
+for the current CLI, the sibling file lock for the legacy CLI), a form POST
+of the refresh token to the configured login host (kimi.com or kimi.ai) with
+kimi-code's public client id. The server issues single-use refresh tokens,
+so the rotated pair is persisted into every file that still holds it (mode
+0600, atomic replace) before the lock is released. Legacy stores (a lone
+kimi-code.json) are kept fresh in place, no bridge needed. Tokens go only to
+the configured official Kimi host over HTTPS (redirects are refused; plain
+HTTP only for loopback test hosts) and are never logged. This prints nothing
+on success; problems go to stderr and the exit code stays 0.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import math
+import os
+import stat
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+REFRESH_SKEW_S = 60
+LOCK_WAIT_SECONDS = 15
+# proper-lockfile's own stale age: a lease left this long unrenewed is dead.
+LOCK_STALE_SECONDS = 10
+# Tokens may only leave this machine for official Kimi hosts.
+ALLOWED_DOMAINS = ("kimi.com", "kimi.ai")
+
+
+class KimiError(Exception):
+  # `refused` marks a credential Kimi turned down; only signing in again
+  # (or a new key) repairs it.
+  def __init__(self, message: str, refused: bool = False) -> None:
+    super().__init__(message)
+    self.refused = refused
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+  # urllib would copy every header (including the bearer token) onto the
+  # redirect target, potentially leaking it cross-host. Never follow.
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    return None
+
+
+# ------------------------------------------------------------------- stores
+
+
+def kimi_code_home() -> Path:
+  return Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code").expanduser()
+
+
+def legacy_home() -> Path:
+  if share := os.environ.get("KIMI_SHARE_DIR", "").strip():
+    return Path(os.path.abspath(share))
+  return Path.home() / ".kimi"
+
+
+def credentials_dir() -> Path:
+  # Mirror the built-in collector exactly, so the bridge targets the file it
+  # actually reads.
+  if home := os.environ.get("KIMI_CODE_HOME"):
+    return Path(home).expanduser() / "credentials"
+  candidates = [Path.home() / ".kimi-code" / "credentials", legacy_home() / "credentials"]
+  for candidate in candidates:
+    if (candidate / "kimi-code.json").is_file():
+      return candidate
+  return candidates[0]
+
+
+def regional_settings(home: Path) -> tuple[str, str]:
+  """The credential slot and login host kimi-code itself selected."""
+  oauth_host = "https://auth.kimi.com"
+  credential_name = "kimi-code.json"
+  try:
+    config = tomllib.loads((home / "config.toml").read_text())
+    provider = config.get("providers", {}).get("managed:kimi-code", {})
+    oauth = provider.get("oauth", {})
+    host = str(oauth.get("oauth_host") or "").strip()
+    if host:
+      oauth_host = host
+    oauth_key = str(oauth.get("key") or "").strip()
+    name = oauth_key.removeprefix("oauth/")
+    if oauth_key.startswith("oauth/") and name and "/" not in name:
+      credential_name = name + ".json"
+  except (OSError, tomllib.TOMLDecodeError, AttributeError):
+    pass
+  return credential_name, (
+    os.environ.get("KIMI_CODE_OAUTH_HOST") or os.environ.get("KIMI_OAUTH_HOST") or oauth_host
+  )
+
+
+def resolve_active(cred_dir: Path, region_name: str) -> Path | None:
+  """The regional credential file the CLI is using, if any."""
+  named = cred_dir / region_name
+  if named.is_file():
+    return named
+  # The config may name a slot the CLI has not written yet (or rotated away
+  # from): fall back to the newest regional file on disk.
+  candidates = [path for path in cred_dir.glob("kimi-code-env-*.json") if path.is_file()]
+  if not candidates:
+    return None
+  return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+  try:
+    parsed = json.loads(path.read_text())
+  except (OSError, json.JSONDecodeError):
+    return {}
+  return parsed if isinstance(parsed, dict) else {}
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+  # Private from the first byte and flushed before it replaces the old one.
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+  try:
+    with os.fdopen(fd, "w") as handle:
+      json.dump(payload, handle)
+      handle.flush()
+      os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+  finally:
+    Path(temporary).unlink(missing_ok=True)
+
+
+def pair_stamp(pair: dict[str, Any]) -> float:
+  try:
+    return float(pair.get("expires_at") or 0)
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def is_fresh(pair: dict[str, Any]) -> bool:
+  # Match the built-in collector: no recorded expiry means indefinite.
+  if not pair.get("access_token"):
+    return False
+  expiry = pair_stamp(pair)
+  return expiry == 0 or expiry - REFRESH_SKEW_S > time.time()
+
+
+# --------------------------------------------------------------------- lock
+
+
+@contextmanager
+def store_lock(cred_dir: Path, home: Path, legacy: bool):
+  """The lock kimi-code itself takes for this store.
+
+  The current CLI uses proper-lockfile's directory lease at
+  <home>/oauth/kimi-code.lock (renewed before its short expiry); the legacy
+  CLI a flock on the sibling kimi-code.lock. Taking the same lock keeps the
+  CLI, the built-in collector and this bridge serialized on one refresh.
+  Yields the lease directory (renew it around slow work) or None.
+  """
+  if legacy:
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    handle = (cred_dir / "kimi-code.lock").open("a")
+    try:
+      while True:
+        try:
+          fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          break
+        except BlockingIOError:
+          if time.monotonic() >= deadline:
+            raise KimiError("Kimi sign-in is busy; try again")
+          time.sleep(0.1)
+      yield None
+    finally:
+      fcntl.flock(handle, fcntl.LOCK_UN)
+      handle.close()
+    return
+
+  lock = home / "oauth" / "kimi-code.lock"
+  lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  deadline = time.monotonic() + LOCK_WAIT_SECONDS
+  while True:
+    try:
+      lock.mkdir(mode=0o700)
+      break
+    except FileExistsError:
+      # The CLI may let go between the mkdir and this look: a lock that is
+      # gone is free, so try again. Only something that is not a directory
+      # blocks the lock for good.
+      try:
+        info = lock.lstat()
+      except FileNotFoundError:
+        continue
+      blocked = not stat.S_ISDIR(info.st_mode)
+      # A lease nobody renewed is left by a CLI that died holding it, and
+      # is taken over the way proper-lockfile itself does.
+      if not blocked and time.time() - info.st_mtime > LOCK_STALE_SECONDS:
+        try:
+          lock.rmdir()
+          continue
+        except OSError:
+          pass
+      if blocked or time.monotonic() >= deadline:
+        raise KimiError("Kimi sign-in is busy; start Kimi and try again")
+      time.sleep(0.1)
+  try:
+    yield lock
+  finally:
+    try:
+      if lock.is_dir():
+        lock.rmdir()
+    except OSError:
+      pass
+
+
+def lease_renew(lock: Path | None):
+  """A lease keeper for the network call that follows."""
+  if lock is None:
+    return lambda: None
+
+  def renew() -> None:
+    try:
+      os.utime(lock, None)
+    except OSError as error:
+      raise KimiError("Kimi sign-in lock was lost") from error
+
+  return renew
+
+
+# ------------------------------------------------------------------ refresh
+
+
+def trusted_url(url: str) -> str:
+  """Return the URL; refuse hosts that may not receive credentials.
+
+  Official Kimi hosts are trusted anywhere; loopback is accepted for plain
+  HTTP so the refresh path can be tested against a mock endpoint.
+  """
+  try:
+    parts = urllib.parse.urlsplit(url)
+  except ValueError as error:
+    raise KimiError("Kimi endpoint URL is invalid") from error
+  host = (parts.hostname or "").lower()
+  loopback = host in ("localhost", "127.0.0.1", "::1")
+  if parts.scheme != "https" and not (loopback and parts.scheme == "http"):
+    raise KimiError("Kimi endpoint must use HTTPS")
+  if parts.username is not None or parts.password is not None:
+    raise KimiError("Kimi endpoint URL must not contain credentials")
+  trusted = any(host == domain or host.endswith("." + domain) for domain in ALLOWED_DOMAINS)
+  if not trusted and not loopback:
+    raise KimiError("Kimi login endpoint is not trusted")
+  return url
+
+
+def request_refresh(refresh_token: str, oauth_host: str, renew) -> dict[str, Any]:
+  url = trusted_url(oauth_host.rstrip("/") + "/api/oauth/token")
+  form = urllib.parse.urlencode(
+    {
+      "client_id": OAUTH_CLIENT_ID,
+      "grant_type": "refresh_token",
+      "refresh_token": refresh_token,
+    }
+  ).encode()
+  headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "User-Agent": "kimi-code",
+  }
+  request = urllib.request.Request(url, data=form, headers=headers)
+  renew()
+  try:
+    with urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=15) as response:
+      decoded = json.load(response)
+  except urllib.error.HTTPError as error:
+    body = {}
+    try:
+      body = json.load(error)
+    except Exception:
+      body = {}
+    description = str(body.get("error_description") or body.get("error") or f"HTTP {error.code}")
+    if error.code in (400, 401, 403):
+      raise KimiError(
+        f"Kimi rejected the sign-in ({description}); sign in again with `kimi login`",
+        refused=True,
+      ) from error
+    raise KimiError(f"Kimi token refresh failed ({description})") from error
+  except urllib.error.URLError as error:
+    raise KimiError("Could not reach the Kimi login service") from error
+  except (json.JSONDecodeError, TimeoutError) as error:
+    raise KimiError("Kimi returned an invalid token response") from error
+  renew()
+  if not isinstance(decoded, dict) or not isinstance(decoded.get("access_token"), str) or not decoded.get("access_token"):
+    raise KimiError("Kimi returned an invalid token response")
+  try:
+    duration = float(decoded.get("expires_in"))
+    if not math.isfinite(duration) or duration <= 0:
+      raise ValueError
+  except (TypeError, ValueError):
+    raise KimiError("Kimi returned an invalid token lifetime")
+  return decoded
+
+
+def do_refresh(pair: dict[str, Any], oauth_host: str, renew) -> dict[str, Any]:
+  refresh_token = str(pair.get("refresh_token") or "")
+  if not refresh_token:
+    raise KimiError("Kimi sign-in is missing; sign in with `kimi login`", refused=True)
+  granted = request_refresh(refresh_token, oauth_host, renew)
+  return {
+    "access_token": str(granted["access_token"]),
+    "refresh_token": str(granted.get("refresh_token") or refresh_token),
+    "expires_at": time.time() + float(granted.get("expires_in")),
+    "expires_in": float(granted.get("expires_in")),
+    "scope": str(granted.get("scope") or pair.get("scope") or ""),
+    "token_type": str(granted.get("token_type") or "Bearer"),
+  }
+
+
+# -------------------------------------------------------------------- bridge
+
+
+def converge(active: Path, bridge: Path) -> None:
+  """End state: the bridge is a symlink to the active file, which holds the
+  freshest pair. The caller holds the store lock."""
+  if bridge.is_symlink():
+    if os.path.exists(bridge) and os.readlink(bridge) == active.name:
+      return
+    bridge.unlink(missing_ok=True)
+    bridge.symlink_to(active.name)
+    return
+  if not bridge.exists():
+    bridge.symlink_to(active.name)
+    return
+  active_pair = read_json(active)
+  bridge_pair = read_json(bridge)
+  if pair_stamp(bridge_pair) > pair_stamp(active_pair):
+    # The built-in collector refreshed through the bridge and its atomic
+    # replace swapped the link for a real file: carry its pair into the
+    # regional store, so the CLI's next refresh finds a live token.
+    write_json_atomic(active, bridge_pair)
+  bridge.unlink(missing_ok=True)
+  bridge.symlink_to(active.name)
+
+
+def bridge_regional_store(cred_dir: Path, home: Path, region_name: str, oauth_host: str) -> None:
+  bridge = cred_dir / "kimi-code.json"
+  with store_lock(cred_dir, home, legacy=False) as lease:
+    active = resolve_active(cred_dir, region_name)
+    renew = lease_renew(lease)
+    if active is None:
+      # No regional file: a stale bridge file may still hold the only pair
+      # (the CLI is mid-migration); keep that one fresh and let the CLI
+      # recreate its own file.
+      if bridge.is_symlink():
+        bridge.unlink(missing_ok=True)
+      if not bridge.is_file() or not read_json(bridge):
+        return
+      pair = read_json(bridge)
+      if is_fresh(pair):
+        return
+      write_json_atomic(bridge, do_refresh(pair, oauth_host, renew))
+      return
+    converge(active, bridge)
+    pair = read_json(active)
+    if not pair or is_fresh(pair):
+      return
+    try:
+      new_pair = do_refresh(pair, oauth_host, renew)
+    except KimiError as error:
+      if error.refused:
+        # A single-use refresh token may already have been spent by the CLI
+        # or the built-in collector: adopt whoever rotated last.
+        if is_fresh(read_json(active)):
+          return
+      raise
+    write_json_atomic(active, new_pair)
+
+
+def keep_plain_store_fresh(cred_dir: Path, home: Path, legacy: bool, oauth_host: str) -> None:
+  """Older releases keep the pair in kimi-code.json itself: keep it fresh."""
+  path = cred_dir / "kimi-code.json"
+  if path.is_symlink() or not path.is_file() or not read_json(path):
+    if path.is_symlink() and not os.path.exists(path):
+      path.unlink(missing_ok=True)
+    return
+  pair = read_json(path)
+  if is_fresh(pair):
+    return
+  with store_lock(cred_dir, home, legacy=legacy) as lease:
+    pair = read_json(path)
+    if not pair or is_fresh(pair):
+      return
+    write_json_atomic(path, do_refresh(pair, oauth_host, lease_renew(lease)))
+
+
+def main() -> int:
+  home = kimi_code_home()
+  cred_dir = credentials_dir()
+  region_name, oauth_host = regional_settings(home)
+  try:
+    if region_name == "kimi-code.json":
+      legacy = not os.environ.get("KIMI_CODE_HOME") and cred_dir == legacy_home() / "credentials"
+      keep_plain_store_fresh(cred_dir, home, legacy, oauth_host)
+    else:
+      bridge_regional_store(cred_dir, home, region_name, oauth_host)
+  except KimiError as error:
+    print(f"agent-usage-zcode: {error}", file=sys.stderr)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
