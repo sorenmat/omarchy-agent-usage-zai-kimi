@@ -37,7 +37,7 @@ collectors/kimi-store-bridge
 OMARCHY_PATH=/usr/share/omarchy /usr/share/omarchy/bin/omarchy-agent-usage-zai --limits-only | jq .
 OMARCHY_PATH=/usr/share/omarchy /usr/share/omarchy/bin/omarchy-agent-usage-kimi --limits-only | jq .
 
-omarchy plugin add ~/code/omarchy-agent-usage-zcode --enable   # install local copy
+omarchy plugin add ~/code/omarchy-agent-usage-zai-kimi --enable   # install local copy
 omarchy plugin remove smo.agent-usage-zcode                     # uninstall
 omarchy plugin list                                             # confirm omarchy.agents panel is enabled
 ```

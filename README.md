@@ -106,7 +106,7 @@ The tabs are the built-in collectors' records, fed by the bridged logins:
 ## Install
 
 ```sh
-omarchy plugin add ~/code/omarchy-agent-usage-zcode --enable
+omarchy plugin add ~/code/omarchy-agent-usage-zai-kimi --enable
 ```
 
 ## Remove
